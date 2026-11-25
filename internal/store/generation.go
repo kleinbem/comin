@@ -1,0 +1,338 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/dustin/go-humanize"
+	"github.com/google/uuid"
+	"github.com/nlewo/comin/pkg/protobuf"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type EvalStatus int64
+
+const (
+	EvalInit EvalStatus = iota
+	Evaluating
+	Evaluated
+	EvalFailed
+	// EvalCanceled is an evaluation that was preempted by a newer
+	// commit rather than one that errored. See BuildCanceled.
+	EvalCanceled
+)
+
+func (s EvalStatus) String() string {
+	switch s {
+	case EvalInit:
+		return "initialized"
+	case Evaluating:
+		return "evaluating"
+	case Evaluated:
+		return "evaluated"
+	case EvalFailed:
+		return "failed"
+	case EvalCanceled:
+		return "canceled"
+	}
+	return "unknown"
+}
+
+func StringToEvalStatus(statusStr string) EvalStatus {
+	switch statusStr {
+	case "initialized":
+		return EvalInit
+	case "evaluating":
+		return Evaluating
+	case "evaluated":
+		return Evaluated
+	case "failed":
+		return EvalFailed
+	case "canceled":
+		return EvalCanceled
+	default:
+		return EvalInit // Default value
+	}
+}
+
+type BuildStatus int64
+
+const (
+	BuildInit BuildStatus = iota
+	Building
+	Built
+	BuildFailed
+	// BuildCanceled is a build that was preempted by a newer commit.
+	// Builder.Eval calls Builder.Stop() before starting a new
+	// generation, which cancels the build context, so this is a
+	// routine part of operation and not an error: the newer
+	// generation is built immediately afterwards. Keeping it out of
+	// BuildFailed is what stops comin_last_build_failed from
+	// alarming every time two commits land close together.
+	BuildCanceled
+)
+
+func (s BuildStatus) String() string {
+	switch s {
+	case BuildInit:
+		return "initialized"
+	case Building:
+		return "building"
+	case Built:
+		return "built"
+	case BuildFailed:
+		return "failed"
+	case BuildCanceled:
+		return "canceled"
+	}
+	return "unknown"
+}
+
+func StringToBuildStatus(statusStr string) BuildStatus {
+	switch statusStr {
+	case "initialized":
+		return BuildInit
+	case "building":
+		return Building
+	case "built":
+		return Built
+	case "failed":
+		return BuildFailed
+	case "canceled":
+		return BuildCanceled
+	default:
+		return BuildInit
+	}
+}
+
+func (s *Store) NewGeneration(hostname, repositoryDir, systemAttr string, rs *protobuf.GitRepositoryStatus, buildAttemptsLimit int) (g protobuf.Generation) {
+	// Find the selected remote URL
+	selectedRemoteUrl := ""
+	for _, remote := range rs.Remotes {
+		if remote.Name == rs.SelectedRemoteName {
+			selectedRemoteUrl = remote.Url
+			break
+		}
+	}
+
+	g = protobuf.Generation{
+		Uuid:   uuid.New().String(),
+		Source: &protobuf.Source{
+			Source: &protobuf.Source_Git{
+				Git: &protobuf.Git{
+					RepositorySubdir:        repositoryDir,
+					SystemAttr:              systemAttr,
+					Hostname:                hostname,
+					SelectedRemoteUrl:       selectedRemoteUrl,
+					SelectedRemoteName:      rs.SelectedRemoteName,
+					SelectedBranchName:      rs.SelectedBranchName,
+					SelectedCommitId:        rs.SelectedCommitId,
+					SelectedCommitMsg:       rs.SelectedCommitMsg,
+					SelectedBranchIsTesting: rs.SelectedBranchIsTesting,
+					MainCommitId:            rs.MainCommitId,
+					MainRemoteName:          rs.MainRemoteName,
+					MainBranchName:          rs.MainBranchName,
+				},
+			},
+		},
+		EvalStatus:   EvalInit.String(),
+		BuildStatus: BuildInit.String(),
+		AttemptNumber: 0,
+		BuildAttemptsLimit: int32(buildAttemptsLimit),
+	}
+	s.persisted.Generations = append(s.persisted.Generations, &g)
+	return
+}
+
+func GenerationShow(g *protobuf.Generation) {
+	padding := "    "
+	fmt.Printf("%sGeneration UUID %s\n", padding, g.Uuid)
+	if g.Source != nil && g.Source.GetGit() != nil {
+		git := g.Source.GetGit()
+		fmt.Printf("%sCommit ID %s from %s/%s\n", padding, git.SelectedCommitId, git.SelectedRemoteName, git.SelectedBranchName)
+		fmt.Printf("%sCommit message: %s\n", padding, strings.Trim(git.SelectedCommitMsg, "\n"))
+	}
+
+	if g.EvalStatus == EvalInit.String() {
+		fmt.Printf("%sNo evaluation started\n", padding)
+		return
+	}
+	if g.EvalStatus == Evaluating.String() {
+		fmt.Printf("%sEvaluation started %s\n", padding, humanize.Time(g.EvalStartedAt.AsTime()))
+		return
+	}
+	switch g.EvalStatus {
+	case Evaluated.String():
+		fmt.Printf("%sEvaluation succeeded %s\n", padding, humanize.Time(g.EvalEndedAt.AsTime()))
+		fmt.Printf("%s  DrvPath: %s\n", padding, g.DrvPath)
+	case EvalFailed.String():
+		fmt.Printf("%sEvaluation failed %s\n", padding, humanize.Time(g.EvalEndedAt.AsTime()))
+	case EvalCanceled.String():
+		fmt.Printf("%sEvaluation canceled %s\n", padding, humanize.Time(g.EvalEndedAt.AsTime()))
+	}
+	if g.BuildStatus == BuildInit.String() {
+		fmt.Printf("%sNo build started\n", padding)
+		return
+	}
+	if g.BuildStatus == Building.String() {
+		fmt.Printf("%sBuild started %s\n", padding, humanize.Time(g.BuildStartedAt.AsTime()))
+		return
+	}
+	switch g.BuildStatus {
+	case Built.String():
+		fmt.Printf("%sBuilt %s\n", padding, humanize.Time(g.BuildEndedAt.AsTime()))
+		fmt.Printf("%s  Outpath:  %s\n", padding, g.OutPath)
+	case BuildFailed.String():
+		fmt.Printf("%sBuild failed %s\n", padding, humanize.Time(g.BuildEndedAt.AsTime()))
+	case BuildCanceled.String():
+		fmt.Printf("%sBuild canceled %s\n", padding, humanize.Time(g.BuildEndedAt.AsTime()))
+	}
+}
+
+// generationsGC garbage collects unwanted generations. This is not thread safe.
+func (s *Store) generationsGC() {
+	alive := make([]*protobuf.Generation, 0)
+	for _, g := range s.persisted.Generations {
+		if g == s.lastEvalStarted || g == s.lastEvalFinished || g == s.lastBuildStarted || g == s.lastBuildFinished {
+			alive = append(alive, g)
+		}
+	}
+	for _, g := range s.persisted.Generations {
+		keep := slices.Contains(alive, g)
+		if !keep {
+			logrus.Infof("store: generation %s removed from the store", g.Uuid)
+		}
+	}
+	s.persisted.Generations = alive
+}
+
+func (s *Store) GenerationEvalStarted(uuid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, err := s.generationGet(uuid)
+	if err != nil {
+		return err
+	}
+	g.EvalStartedAt = timestamppb.New(time.Now().UTC())
+	g.EvalStatus = Evaluating.String()
+
+	s.lastEvalStarted = g
+	s.generationsGC()
+	e := &protobuf.Event_EvalStarted{Generation: g}
+	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_EvalStartedType{EvalStartedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+	return nil
+}
+
+func (s *Store) GenerationEvalFinished(uuid string, drvPath, outPath, machineId string, evalErr error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, err := s.generationGet(uuid)
+	if err != nil {
+		return err
+	}
+	if errors.Is(evalErr, context.Canceled) {
+		g.EvalErr = evalErr.Error()
+		g.EvalStatus = EvalCanceled.String()
+	} else if evalErr != nil {
+		g.EvalErr = evalErr.Error()
+		g.EvalStatus = EvalFailed.String()
+	} else {
+		g.EvalStatus = Evaluated.String()
+	}
+	g.DrvPath = drvPath
+	g.OutPath = outPath
+	g.MachineId = machineId
+	g.EvalEndedAt = timestamppb.New(time.Now().UTC())
+	s.lastEvalFinished = g
+	s.generationsGC()
+	e := &protobuf.Event_EvalFinished{Generation: g}
+	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_EvalFinishedType{EvalFinishedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+	return nil
+}
+
+func (s *Store) GenerationBuildStart(uuid, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, err := s.generationGet(uuid)
+	if err != nil {
+		return err
+	}
+	g.BuildStartedAt = timestamppb.New(time.Now().UTC())
+	g.BuildStatus = Building.String()
+	g.BuildReason = reason
+	g.AttemptNumber++
+	s.lastBuildStarted = g
+	s.generationsGC()
+	e := &protobuf.Event_BuildStarted{Generation: g}
+	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_BuildStartedType{BuildStartedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+	return nil
+}
+
+func (s *Store) GenerationBuildFinished(uuid string, buildErr error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, err := s.generationGet(uuid)
+	if err != nil {
+		return err
+	}
+	g.BuildEndedAt = timestamppb.New(time.Now().UTC())
+	if buildErr == nil {
+		g.BuildErr = ""
+		g.BuildStatus = Built.String()
+		// We create a gcroots for the last built generation
+		// in order to avoid the Nix garbage collector to
+		// remove this store path which could be used later by
+		// the deployment step.
+		if _, err := os.Lstat(s.generationGcRoot); err == nil {
+			if err := os.Remove(s.generationGcRoot); err != nil {
+				logrus.Error(err)
+			}
+		}
+		if err := os.Symlink(g.OutPath, s.generationGcRoot); err != nil {
+			logrus.Errorf("Could not create the gcroot symlink for the generation %s: %s", g.Uuid, err)
+		}
+	} else if errors.Is(buildErr, context.Canceled) {
+		g.BuildStatus = BuildCanceled.String()
+		g.BuildErr = buildErr.Error()
+	} else {
+		g.BuildStatus = BuildFailed.String()
+		g.BuildErr = buildErr.Error()
+	}
+	s.lastBuildFinished = g
+	s.generationsGC()
+	e := &protobuf.Event_BuildFinished{Generation: g}
+	s.broker.Publish(&protobuf.Event{Type: &protobuf.Event_BuildFinishedType{BuildFinishedType: e}, CreatedAt: timestamppb.New(time.Now().UTC())})
+	return nil
+}
+
+// GenerationGet is thread safe and returns a copy
+func (s *Store) GenerationGet(uuid string) (protobuf.Generation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, g := range s.persisted.Generations {
+		if g.Uuid == uuid {
+			return *(proto.CloneOf(g)), nil
+		}
+	}
+	return protobuf.Generation{}, fmt.Errorf("store: no generation with uuid %s has been found", uuid)
+}
+
+func (s *Store) generationGet(uuid string) (g *protobuf.Generation, err error) {
+	for _, g := range s.persisted.Generations {
+		if g.Uuid == uuid {
+			return g, nil
+		}
+	}
+	return nil, fmt.Errorf("store: no generation with uuid %s has been found", uuid)
+}
+
+func GenerationHasToBeBuilt(g *protobuf.Generation) bool {
+	return g.EvalStatus == Evaluated.String() && g.BuildStatus != Built.String()
+}

@@ -1,0 +1,99 @@
+package types
+
+const OperationTest = "test"
+const OperationSwitch = "switch"
+const OperationBoot = "boot"
+const OperationNull = "null"
+
+type Remote struct {
+	Name     string
+	URL      string
+	Auth     Auth
+	Branches Branches `yaml:"branches"`
+	Timeout  int      `yaml:"timeout"`
+	// The period to poll the remote in second
+	Poller Poller `yaml:"poller"`
+}
+
+type Poller struct {
+	Period int `yaml:"period"`
+}
+
+type GitConfig struct {
+	// The repository Path
+	Path string
+	// The directory in the repository
+	Dir                   string
+	Remotes               []Remote
+	GpgPublicKeyPaths     []string
+	SshAllowedSignersPath string
+	Submodules            bool
+}
+
+type Auth struct {
+	AccessToken       string
+	AccessTokenPath   string `yaml:"access_token_path"`
+	SshDeployKeyPath  string `yaml:"ssh_deploy_key_path"`
+	SshKnownHostsPath string `yaml:"ssh_known_hosts_path"`
+	Username          string
+}
+
+type Branch struct {
+	Name string `yaml:"name"`
+	// TODO: use it
+	Protected bool   `yaml:"protected"`
+	Operation string `yaml:"operation"`
+}
+
+type Branches struct {
+	Main    Branch `yaml:"main"`
+	Testing Branch `yaml:"testing"`
+}
+
+type HttpServer struct {
+	ListenAddress string `yaml:"listen_address"`
+	Port          int    `yaml:"port"`
+}
+
+type Grpc struct {
+	UnixSocketPath    string `yaml:"unix_socket_path"`
+	UnixSocketMode    string `yaml:"unix_socket_mode"`
+	UnixSocketGroup   string `yaml:"unix_socket_group"`
+}
+
+type Confirmer struct {
+	Mode         string `yaml:"mode"`
+	AutoDuration int    `yaml:"autoconfirm_duration"`
+}
+
+type Retention struct {
+	DeploymentBootEntryCapacity  int `yaml:"deployment_boot_entry_capacity"`
+	DeploymentSuccessfulCapacity int `yaml:"deployment_successful_capacity"`
+	DeploymentAnyCapacity        int `yaml:"deployment_any_capacity"`
+}
+
+type Configuration struct {
+	Hostname      string `yaml:"hostname"`
+	StateDir      string `yaml:"state_dir"`
+	StateFilepath string `yaml:"state_filepath"`
+	// RepositoryType describes type of the repository. It can currently only be "flake"
+	RepositoryType        string     `yaml:"repository_type"`
+	RepositorySubdir      string     `yaml:"repository_subdir"`
+	Submodules            bool       `yaml:"submodules"`
+	SystemAttr            string     `yaml:"system_attr"`
+	Remotes               []Remote   `yaml:"remotes"`
+	ApiServer             HttpServer `yaml:"api_server"`
+	Grpc                  Grpc       `yaml:"grpc"`
+	Exporter              HttpServer `yaml:"exporter"`
+	GpgPublicKeyPaths     []string   `yaml:"gpg_public_key_paths"`
+	SshAllowedSignersPath string     `yaml:"ssh_allowed_signers_path"`
+	PostDeploymentCommand string     `yaml:"post_deployment_command"`
+	PostBuildCommand      string     `yaml:"post_build_command"`
+	BuildConfirmer        Confirmer  `yaml:"build_confirmer"`
+	DeployConfirmer       Confirmer  `yaml:"deploy_confirmer"`
+	Retention             Retention  `yaml:"retention"`
+	EvalTimeout           int        `yaml:"eval_timeout"`
+	BuildTimeout          int        `yaml:"build_timeout"`
+	BuildAttemptsLimit    int        `yaml:"build_attempts_limit"`
+	BuildRetryTimer       int        `yaml:"build_retry_timer"`
+}
