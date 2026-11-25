@@ -1,0 +1,150 @@
+package cmd
+
+import (
+	"fmt"
+
+	"github.com/dustin/go-humanize"
+	"google.golang.org/protobuf/encoding/protojson"
+
+	"github.com/nlewo/comin/pkg/client"
+	"github.com/nlewo/comin/internal/deployer"
+	pb "github.com/nlewo/comin/pkg/protobuf"
+	store "github.com/nlewo/comin/internal/store"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+)
+
+var statusOneline bool
+var statusJson bool
+var unixSocketPath string
+
+func longStatus(status *pb.State) {
+	fmt.Printf("Status of the machine %s\n", status.Builder.Hostname)
+	if status.NeedToReboot.GetValue() {
+		fmt.Printf("  Need to reboot: yes\n")
+	}
+	if status.IsSuspended.GetValue() {
+		fmt.Printf("  Is suspended: yes\n")
+	}
+	fmt.Printf("  Fetcher\n")
+	gitRepoStatus := status.Fetcher.GetGitRepositoryStatus()
+	if gitRepoStatus != nil && gitRepoStatus.SelectedCommitShouldBeSigned.GetValue() {
+		if gitRepoStatus.SelectedCommitSigned.GetValue() {
+			fmt.Printf("    Commit %s signed by %s\n", gitRepoStatus.SelectedCommitId, gitRepoStatus.SelectedCommitSignedBy)
+		} else {
+			fmt.Printf("    Commit %s is not signed while it should be\n", gitRepoStatus.SelectedCommitId)
+		}
+	}
+	if gitRepoStatus != nil {
+		for _, r := range gitRepoStatus.Remotes {
+			fmt.Printf("    Remote %s %s fetched %s\n",
+				r.Name, r.Url, humanize.Time(r.FetchedAt.AsTime()),
+			)
+		}
+	}
+	fmt.Printf("  Builder\n")
+	if status.Builder.Generation != nil {
+		store.GenerationShow(status.Builder.Generation)
+	} else {
+		fmt.Printf("    No build available\n")
+	}
+	deployer.Show(status.Deployer, "    ")
+}
+
+func jsonStatus(status *pb.State) {
+	// Create a protojson marshaler with options
+	marshaler := protojson.MarshalOptions{
+		// Use proto field names (not camelCase)
+		UseProtoNames: true,
+		// Include fields with zero values
+		EmitUnpopulated: true,
+		// Pretty-print with indentation
+		Indent: "  ",
+		// Allow multiple marshaling of the same message
+		AllowPartial: true,
+	}
+
+	buf, err := marshaler.Marshal(status)
+	if err != nil {
+		logrus.Fatalf("Error while marshaling the state to JSON: %s", err)
+	}
+	fmt.Printf("%s", buf)
+}
+
+func onelineStatus(status *pb.State) {
+	if status.BuildConfirmer.Submitted != "" && status.BuildConfirmer.Confirmed == "" || status.DeployConfirmer.Submitted != "" && status.DeployConfirmer.Confirmed == "" {
+		fmt.Printf(" ❔ ")
+	}
+	if status.IsSuspended.GetValue() {
+		fmt.Printf(" ⏸️ ")
+	}
+	if status.Builder.Generation != nil && status.Builder.IsEvaluating.GetValue() {
+		git := getGitFromGeneration(status.Builder.Generation)
+		fmt.Printf(" eval   %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+			humanize.Time(status.Builder.Generation.EvalStartedAt.AsTime()))
+	} else if status.Builder.Generation != nil && status.Builder.IsBuilding.GetValue() {
+		git := getGitFromGeneration(status.Builder.Generation)
+		fmt.Printf(" build  %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+			humanize.Time(status.Builder.Generation.BuildStartedAt.AsTime()))
+	} else if status.Builder.Generation != nil && status.Builder.Generation.EvalStatus == store.EvalFailed.String() {
+		git := getGitFromGeneration(status.Builder.Generation)
+		fmt.Printf(" %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+			humanize.Time(status.Builder.Generation.EvalEndedAt.AsTime()))
+	} else if status.Builder.Generation != nil && status.Builder.Generation.BuildStatus == store.BuildFailed.String() {
+		git := getGitFromGeneration(status.Builder.Generation)
+		fmt.Printf(" %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+			humanize.Time(status.Builder.Generation.BuildEndedAt.AsTime()))
+	} else if status.Deployer.Deployment != nil {
+		git := getGitFromGeneration(status.Deployer.Deployment.Generation)
+		switch status.Deployer.Deployment.Status {
+		case store.StatusToString(store.Running):
+			fmt.Printf(" deploy %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+				humanize.Time(status.Deployer.Deployment.EndedAt.AsTime()))
+		case store.StatusToString(store.Failed):
+			fmt.Printf(" %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+				humanize.Time(status.Deployer.Deployment.EndedAt.AsTime()))
+		case store.StatusToString(store.Done):
+			fmt.Printf(" %s/%s (%s)", git.SelectedRemoteName, git.SelectedBranchName,
+				humanize.Time(status.Deployer.Deployment.EndedAt.AsTime()))
+		}
+	}
+	if status.NeedToReboot.GetValue() {
+		fmt.Printf(" ")
+	}
+}
+
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Get the status of the local machine",
+	Args:  cobra.MinimumNArgs(0),
+	Run: func(cmd *cobra.Command, args []string) {
+		if unixSocketPath == "" {
+			unixSocketPath = "/run/comin-grpc.sock"
+		}
+		opts := client.ClientOpts{
+			UnixSocketPath: unixSocketPath,
+		}
+		c, err := client.New(opts)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+		status, err := c.GetManagerState()
+		if err != nil {
+			logrus.Fatal(err)
+		}
+		if statusJson {
+			jsonStatus(status)
+		} else if statusOneline {
+			onelineStatus(status)
+		} else {
+			longStatus(status)
+		}
+	},
+}
+
+func init() {
+	statusCmd.PersistentFlags().BoolVarP(&statusOneline, "oneline", "", false, "oneline")
+	statusCmd.PersistentFlags().BoolVarP(&statusJson, "json", "", false, "json")
+	statusCmd.PersistentFlags().StringVarP(&unixSocketPath, "unix-socket-path", "", "", "the GRPC Unix path (default to /run/comin-grpc.sock)")
+	rootCmd.AddCommand(statusCmd)
+}

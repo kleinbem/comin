@@ -1,0 +1,113 @@
+package cmd
+
+import (
+	"time"
+
+	"github.com/nlewo/comin/pkg/client"
+	"github.com/nlewo/comin/pkg/protobuf"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+func dStarted(status string) *protobuf.Event {
+	return &protobuf.Event{Type: &protobuf.Event_DeploymentStartedType{DeploymentStartedType: &protobuf.Event_DeploymentStarted{Deployment: &protobuf.Deployment{
+		Uuid:      "b9c9c304-cb7d-4682-a052-57abd427e2b0",
+		Operation: "switch",
+		Status:    status,
+		Generation: &protobuf.Generation{
+			Uuid:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+			Source: &protobuf.Source{
+				Source: &protobuf.Source_Git{
+					Git: &protobuf.Git{
+						SelectedRemoteName: "origin",
+						SelectedBranchName: "main",
+						SelectedCommitId:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+						SelectedCommitMsg:  "commit message\nmulti line",
+					},
+				},
+			},
+		},
+	}}}, CreatedAt: timestamppb.New(time.Now().UTC())}
+}
+func dFinished(status string) *protobuf.Event {
+	return &protobuf.Event{Type: &protobuf.Event_DeploymentFinishedType{DeploymentFinishedType: &protobuf.Event_DeploymentFinished{Deployment: &protobuf.Deployment{
+		Uuid:      "b9c9c304-cb7d-4682-a052-57abd427e2b0",
+		Operation: "switch",
+		Status:    status,
+		Generation: &protobuf.Generation{
+			Uuid:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+			Source: &protobuf.Source{
+				Source: &protobuf.Source_Git{
+					Git: &protobuf.Git{
+						SelectedRemoteName: "origin",
+						SelectedBranchName: "main",
+						SelectedCommitId:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+						SelectedCommitMsg:  "commit message\nmulti line",
+					},
+				},
+			},
+		},
+	}}}, CreatedAt: timestamppb.New(time.Now().UTC())}
+}
+func bStarted(status string) *protobuf.Event {
+	return &protobuf.Event{Type: &protobuf.Event_BuildStartedType{BuildStartedType: &protobuf.Event_BuildStarted{Generation: &protobuf.Generation{
+		Uuid:        "b9c9c304-cb7d-4682-a052-57abd427e2b0",
+		BuildStatus: status,
+		Source: &protobuf.Source{
+			Source: &protobuf.Source_Git{
+				Git: &protobuf.Git{
+					SelectedRemoteName: "origin",
+					SelectedBranchName: "main",
+					SelectedCommitId:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+					SelectedCommitMsg:  "commit message\nmulti line",
+				},
+			},
+		},
+	}}}, CreatedAt: timestamppb.New(time.Now().UTC())}
+}
+func bFinished(status string) *protobuf.Event {
+	return &protobuf.Event{Type: &protobuf.Event_BuildFinishedType{BuildFinishedType: &protobuf.Event_BuildFinished{Generation: &protobuf.Generation{
+		Uuid:        "b9c9c304-cb7d-4682-a052-57abd427e2b0",
+		BuildStatus: status,
+		Source: &protobuf.Source{
+			Source: &protobuf.Source_Git{
+				Git: &protobuf.Git{
+					SelectedRemoteName: "origin",
+					SelectedBranchName: "main",
+					SelectedCommitId:   "d3b9c304-cb7d-4682-a052-57abd427e2b0",
+					SelectedCommitMsg:  "commit message\nmulti line",
+				},
+			},
+		},
+	}}}, CreatedAt: timestamppb.New(time.Now().UTC())}
+}
+
+func watchScenario() chan client.Streamer {
+	state := &protobuf.State{
+		NeedToReboot: wrapperspb.Bool(false),
+		Deployer: &protobuf.Deployer{
+			IsDeploying: wrapperspb.Bool(false),
+			Deployment:  dFinished("done").GetDeploymentFinishedType().Deployment,
+		},
+	}
+	init := &protobuf.Event{Type: &protobuf.Event_ManagerState_{ManagerState: &protobuf.Event_ManagerState{State: state}}, CreatedAt: timestamppb.New(time.Now().UTC())}
+
+	events := []client.Streamer{
+		{Event: init},
+		{FailureMsg: "not connected"},
+		{FailureMsg: ""},
+		{Event: bStarted("initialized")},
+		{Event: bFinished("built")},
+		{Event: dStarted("init")},
+		{Event: dFinished("done")},
+		{Event: dFinished("failed")},
+	}
+	ch := make(chan client.Streamer)
+	go func() {
+		for _, e := range events {
+			ch <- e
+			time.Sleep(1 * time.Second)
+		}
+	}()
+	return ch
+}
