@@ -1,0 +1,523 @@
+// This package is used to evaluate and build the Nix expression
+// describing a system to be deployed.
+//
+// It works asyncronously but evaluation and build are
+// sequentials. When an evaluation is started, it cancels a running
+// evaluation or running build.
+
+// The Builder can only manage a single generation. This generation
+// first needs to be evaluated and then built.
+package builder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/nlewo/comin/internal/broker"
+	"github.com/nlewo/comin/internal/executor"
+	"github.com/nlewo/comin/internal/store"
+	"github.com/nlewo/comin/internal/utils"
+	"github.com/nlewo/comin/pkg/protobuf"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+const (
+	BuildReasonAlreadyBuilt = "already built"
+	BuildReasonNeedBuild    = "need to be built"
+)
+
+type Builder struct {
+	store                *store.Store
+	executor             executor.Executor
+	broker               *broker.Broker
+	hostname             string
+	repositoryPath       string
+	repositoryDir        string
+	systemAttr           string
+	submodules           bool
+	evalTimeout          time.Duration
+	buildTimeout         time.Duration
+	buildAttemptsLimit   int
+	buildRetryTimerDuration time.Duration
+
+	mu           sync.Mutex
+	isEvaluating atomic.Bool
+	isBuilding   atomic.Bool
+
+	// GenerationUuid is the generation UUID currently managed by
+	// the builder. This generation can be evaluating, evaluated,
+	// building or built.
+	// To access this generation, you need to query the store.
+	GenerationUuid string
+
+	// EvaluationDone is used to be notified a evaluation is finished. Be careful since only a single goroutine can listen it.
+	EvaluationDone chan string
+	// BuildDone is used to be notified a build is finished. Be careful since only a single goroutine can listen it.
+	BuildDone chan string
+
+	evaluator   Exec
+	evaluatorWg *sync.WaitGroup
+
+	buildator   Exec
+	buildatorWg *sync.WaitGroup
+
+	isSuspended bool
+
+	postBuildCommand string
+
+	// Retry fields
+	buildRetryAt   *timestamppb.Timestamp
+	buildRetryTimer *time.Timer
+	buildRetryCtx   context.Context
+	buildRetryCancel context.CancelFunc
+}
+
+func New(store *store.Store, executor executor.Executor, broker *broker.Broker, repositoryPath, repositoryDir, systemAttr, hostname string, submodules bool, evalTimeout time.Duration, buildTimeout time.Duration, buildAttemptsLimit int, buildRetryTimer time.Duration, postBuildCommand string) *Builder {
+	logrus.Infof("builder: initialization with repositoryPath=%s, repositoryDir=%s, systemAttr=%s, hostname=%s, submodules=%v, evalTimeout=%fs, buildTimeout=%fs, buildAttemptsLimit=%d, buildRetryTimer=%fs, postBuildCommand=%s",
+		repositoryPath, repositoryDir, systemAttr, hostname, submodules, evalTimeout.Seconds(), buildTimeout.Seconds(), buildAttemptsLimit, buildRetryTimer.Seconds(), postBuildCommand)
+
+	return &Builder{
+		store:            store,
+		executor:         executor,
+		broker:           broker,
+		repositoryPath:   repositoryPath,
+		repositoryDir:    repositoryDir,
+		systemAttr:       systemAttr,
+		submodules:       submodules,
+		hostname:         hostname,
+		evalTimeout:      evalTimeout,
+		buildTimeout:     buildTimeout,
+		buildAttemptsLimit:   buildAttemptsLimit,
+		buildRetryTimerDuration: buildRetryTimer,
+		postBuildCommand: postBuildCommand,
+		EvaluationDone:   make(chan string, 1),
+		BuildDone:        make(chan string, 1),
+		evaluatorWg:      &sync.WaitGroup{},
+		buildatorWg:      &sync.WaitGroup{},
+
+	}
+}
+
+func (b *Builder) State() *protobuf.Builder {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var generation *protobuf.Generation
+	var generationUUID string
+
+	if b.GenerationUuid != "" {
+		generationUUID = b.GenerationUuid
+		if g, err := b.store.GenerationGet(b.GenerationUuid); err == nil {
+			generation = &g
+		} else {
+			logrus.Errorf("builder: generation %s not found in the store: %s", generationUUID, err)
+		}
+	}
+	var buildRetryAt *timestamppb.Timestamp
+	if b.buildRetryAt != nil {
+		buildRetryAt = proto.Clone(b.buildRetryAt).(*timestamppb.Timestamp)
+	}
+	return &protobuf.Builder{
+		Hostname:       b.hostname,
+		IsBuilding:     wrapperspb.Bool(b.isBuilding.Load()),
+		IsEvaluating:   wrapperspb.Bool(b.isEvaluating.Load()),
+		Generation:     generation,
+		GenerationUuid: generationUUID,
+		IsSuspended:    wrapperspb.Bool(b.isSuspended),
+		RepositoryPath: b.repositoryPath,
+		BuildRetryAt:   buildRetryAt,
+	}
+}
+
+func (b *Builder) IsEvaluating() bool {
+	return b.isEvaluating.Load()
+}
+
+func (b *Builder) GetHostname() string {
+	return b.hostname
+}
+
+func (b *Builder) GetRepositoryPath() string {
+	return b.repositoryPath
+}
+
+func (b *Builder) GetRepositoryDir() string {
+	return b.repositoryDir
+}
+
+func (b *Builder) GetBuildAttemptsLimit() int {
+	return b.buildAttemptsLimit
+}
+
+func (b *Builder) GetSystemAttr() string {
+	return b.systemAttr
+}
+
+func (b *Builder) stopEval() {
+	b.evaluator.Stop()
+	b.evaluatorWg.Wait()
+	b.isEvaluating.Store(false)
+}
+
+// stopBuild stops the build. If a build is actually running, it
+// returns the building generationUUID, otherwise, it returns nil.
+// Because the builder is not locked during the whole stop process, it
+// is possible to return a generationUUID while the build of this
+// generation is finished. This is however not a important issue since
+// the builder will just rebuild the generation.
+func (b *Builder) stopBuild() {
+	b.buildator.Stop()
+	b.buildatorWg.Wait()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.isBuilding.Store(false)
+}
+
+// Stop stops the evaluator and the builder is required and wait until
+// they have been actually stopped.
+func (b *Builder) Stop() {
+	b.stopEval()
+	b.stopBuild()
+	b.cancelBuildRetry()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+}
+
+// cancelBuildRetry cancels any pending build retry
+func (b *Builder) cancelBuildRetry() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buildRetryCancel != nil {
+		b.buildRetryCancel()
+		b.buildRetryCancel = nil
+	}
+	if b.buildRetryTimer != nil {
+		b.buildRetryTimer.Stop()
+		b.buildRetryTimer = nil
+	}
+	b.buildRetryAt = nil
+}
+
+// scheduleBuildRetry schedules a retry for the current generation
+func (b *Builder) scheduleBuildRetry(generationUuid string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Cancel any existing retry (without locking again)
+	if b.buildRetryCancel != nil {
+		b.buildRetryCancel()
+		b.buildRetryCancel = nil
+	}
+	if b.buildRetryTimer != nil {
+		b.buildRetryTimer.Stop()
+		b.buildRetryTimer = nil
+	}
+	b.buildRetryAt = nil
+
+	// Set the retry time
+	retryAt := time.Now().Add(b.buildRetryTimerDuration)
+	b.buildRetryAt = timestamppb.New(retryAt)
+
+	// Create context for the retry
+	b.buildRetryCtx, b.buildRetryCancel = context.WithCancel(context.Background())
+
+	// Start the timer
+	b.buildRetryTimer = time.AfterFunc(b.buildRetryTimerDuration, func() {
+		// Capture generationUuid in the closure
+		retryGenerationUuid := generationUuid
+		b.mu.Lock()
+		// Check if we still have a retry scheduled (might have been cancelled)
+		if b.buildRetryAt != nil {
+			logrus.Infof("builder: retrying build for generation %s after failure", retryGenerationUuid)
+			// The attempt number will be incremented by GenerationBuildStart
+			// Clear retry state and save context before unlocking
+			buildRetryCtx := b.buildRetryCtx
+			b.buildRetryAt = nil
+			b.buildRetryTimer = nil
+			b.buildRetryCancel = nil
+			b.mu.Unlock()
+			// Submit the build for retry (outside the lock to avoid deadlock)
+			b.SubmitBuild(buildRetryCtx, retryGenerationUuid)
+		} else {
+			b.mu.Unlock()
+		}
+	})
+}
+
+type Evaluator struct {
+	source   *protobuf.Source
+	evalFunc executor.EvalFunc
+
+	drvPath   string
+	outPath   string
+	machineId string
+
+	stdout io.WriteCloser
+	stderr io.WriteCloser
+}
+
+func (r *Evaluator) Run(ctx context.Context) (err error) {
+	r.drvPath, r.outPath, r.machineId, err = r.evalFunc(ctx, r.source, r.stdout, r.stderr)
+	return err
+}
+
+type Buildator struct {
+	drvPath   string
+	buildFunc executor.BuildFunc
+	stdout    io.WriteCloser
+	stderr    io.WriteCloser
+}
+
+func (r *Buildator) Run(ctx context.Context) (err error) {
+	return r.buildFunc(ctx, r.drvPath, r.stdout, r.stderr)
+}
+
+// Eval evaluates a generation. It cancels current any generation
+// evaluation or build.
+//
+// At the end of the evaluation, if the storepath is already in the
+// Nix store, it then consider the build is done. In this case, it
+// doesn't notify for the end of the evaluation but for the end of the
+// build.
+func (b *Builder) Eval(ctx context.Context, generation *protobuf.Generation) error {
+	// This is to prempt the builder since we don't need to allow
+	// several evaluation in parallel
+	b.Stop()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.isEvaluating.Store(true)
+
+	if err := b.store.GenerationEvalStarted(generation.Uuid); err != nil {
+		return err
+	}
+	b.GenerationUuid = generation.Uuid
+
+	stdout, stderr := b.broker.GetLogger("evaluation", generation.Uuid)
+
+	evaluator := &Evaluator{
+		source:   generation.Source,
+		evalFunc: b.executor.Eval,
+		stdout:   stdout,
+		stderr:   stderr,
+	}
+	b.evaluator = NewExec(evaluator, b.evalTimeout)
+
+	// This is to wait until the evaluator is stopped
+	b.evaluatorWg.Add(1)
+	b.evaluator.Start(ctx)
+
+	go func() {
+		defer b.evaluatorWg.Done()
+		b.evaluator.Wait()
+
+		// We close the writers to stop associated goroutines
+		_ = stdout.Close()
+		_ = stderr.Close()
+
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if err := b.store.GenerationEvalFinished(
+			generation.Uuid,
+			evaluator.drvPath,
+			evaluator.outPath,
+			evaluator.machineId,
+			b.evaluator.getErr(),
+		); err != nil {
+			logrus.Errorf("builder: %s", err)
+		}
+
+		b.isEvaluating.Store(false)
+		if b.executor.IsStorePathExist(evaluator.outPath) {
+			if err := b.store.GenerationBuildStart(generation.Uuid, BuildReasonAlreadyBuilt); err != nil {
+				logrus.Errorf("builder: %s", err)
+			}
+			if err := b.store.GenerationBuildFinished(generation.Uuid, nil); err != nil {
+				logrus.Errorf("builder: %s", err)
+			}
+			b.runPostBuildCommandIfSet(generation, BuildReasonAlreadyBuilt, "")
+			select {
+			case b.BuildDone <- generation.Uuid:
+			default:
+			}
+
+		} else {
+			select {
+			case b.EvaluationDone <- generation.Uuid:
+			default:
+			}
+		}
+	}()
+	return nil
+}
+
+// Suspend only suspends the build. If an evaluation is running, it won't be stopped.
+func (b *Builder) Suspend() error {
+	if b.isSuspended {
+		return fmt.Errorf("the builder is already suspended")
+	}
+	b.stopBuild()
+	logrus.Infof("builder: builder is suspended")
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.isSuspended = true
+	return nil
+}
+
+func (b *Builder) Resume(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.isSuspended {
+		return fmt.Errorf("the builder is not suspended")
+	} else {
+		b.isSuspended = false
+		// When the builder is freshly initialized, no generation exists yet.
+		if b.GenerationUuid == "" {
+			return nil
+		}
+		generation, err := b.store.GenerationGet(b.GenerationUuid)
+		if err != nil {
+			return err
+		}
+		if store.GenerationHasToBeBuilt(&generation) {
+			logrus.Infof("builder: builder is resumed and generation %s has to be built", b.GenerationUuid)
+			// TODO: expose the error in the builder state
+			if err := b.build(context.Background(), b.GenerationUuid); err != nil {
+				logrus.Errorf("builder: failed to build the generation %s: %s", b.GenerationUuid, err)
+			}
+		} else {
+			logrus.Infof("builder: builder is resumed while no generation has to be built")
+		}
+	}
+	return nil
+}
+
+// SubmitBuild submits a generation for building. If the builder is
+// suspended, the generation is only built once resumed, otherwise, it
+// is built immediately.
+func (b *Builder) SubmitBuild(ctx context.Context, generationUuid string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.isSuspended {
+		logrus.Infof("builder: build submitted for generation %s while the builder is suspended", generationUuid)
+	} else {
+		// TODO: expose the error in the builder state
+		if err := b.build(ctx, generationUuid); err != nil {
+			logrus.Error(err)
+		}
+	}
+}
+
+// build builds a generation which has been previously evaluated. This is not thread safe.
+func (b *Builder) build(ctx context.Context, generationUuid string) error {
+	logrus.Infof("builder: build of generation %s is starting", generationUuid)
+	if b.GenerationUuid != "" && generationUuid != b.GenerationUuid {
+		return fmt.Errorf("another generation is evaluating or evaluated")
+	}
+
+	generation, err := b.store.GenerationGet(generationUuid)
+	if err != nil {
+		return err
+	}
+	if generation.EvalStatus != store.Evaluated.String() {
+		return fmt.Errorf("the generation is not evaluated")
+	}
+	if b.isBuilding.Load() {
+		return fmt.Errorf("the builder is already building")
+	}
+	if generation.BuildStatus == store.Built.String() {
+		return fmt.Errorf("the generation is already built")
+	}
+
+	if err := b.store.GenerationBuildStart(generationUuid, BuildReasonNeedBuild); err != nil {
+		return err
+	}
+	b.isBuilding.Store(true)
+	stdout, stderr := b.broker.GetLogger("build", generation.Uuid)
+	buildator := &Buildator{
+		drvPath:   generation.DrvPath,
+		buildFunc: b.executor.Build,
+		stdout:    stdout,
+		stderr:    stderr,
+	}
+	b.buildator = NewExec(buildator, b.buildTimeout)
+
+	// This is to wait until the evaluator is stopped
+	b.buildatorWg.Add(1)
+	b.buildator.Start(ctx)
+
+	go func() {
+		defer b.buildatorWg.Done()
+		b.buildator.Wait()
+
+		// We close the writers to stop associated goroutines
+		_ = stdout.Close()
+		_ = stderr.Close()
+
+		buildErr := b.buildator.getErr()
+		b.mu.Lock()
+		err := b.store.GenerationBuildFinished(generationUuid, buildErr)
+		if err != nil {
+			logrus.Error(err)
+		}
+		status := store.Built
+		if buildErr != nil {
+			status = store.BuildFailed
+		}
+		b.runPostBuildCommandIfSet(&generation, status.String(), errMsg(buildErr))
+		b.isBuilding.Store(false)
+		select {
+		case b.BuildDone <- generationUuid:
+		default:
+			logrus.Errorf("builder: the build has not been notified")
+		}
+		b.mu.Unlock()
+
+		// If build failed, schedule a retry (outside the lock to avoid deadlock)
+		if buildErr != nil {
+			// Do not retry if the build was cancelled
+			if errors.Is(buildErr, context.Canceled) {
+				logrus.Infof("builder: build cancelled for generation %s, not scheduling retry", generationUuid)
+			} else {
+				// Check if we've reached the build attempts limit
+				generation, genErr := b.store.GenerationGet(generationUuid)
+				if genErr != nil {
+					logrus.Errorf("builder: failed to get generation %s to check build attempts limit: %s", generationUuid, genErr)
+				} else if b.buildAttemptsLimit > 0 && generation.AttemptNumber >= int32(b.buildAttemptsLimit) {
+					logrus.Infof("builder: build failed for generation %s but build attempts limit (%d) reached", generationUuid, b.buildAttemptsLimit)
+				} else {
+					logrus.Infof("builder: build failed for generation %s, scheduling retry in %fs", generationUuid, b.buildRetryTimerDuration.Seconds())
+					b.scheduleBuildRetry(generationUuid)
+				}
+			}
+		}
+	}()
+	return nil
+}
+
+func errMsg(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (b *Builder) runPostBuildCommandIfSet(g *protobuf.Generation, status, errMsg string) {
+	cmd := b.postBuildCommand
+	if cmd == "" {
+		return
+	}
+	if _, err := utils.RunPostCommand(cmd, "build", g, status, errMsg); err != nil {
+		logrus.Errorf("builder: post build command [%s] for generation %s failed %v", cmd, g.Uuid, err)
+	}
+}

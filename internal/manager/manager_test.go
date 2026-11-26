@@ -1,0 +1,321 @@
+package manager
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/nlewo/comin/internal/broker"
+	"github.com/nlewo/comin/internal/builder"
+	"github.com/nlewo/comin/internal/deployer"
+	"github.com/nlewo/comin/internal/executor"
+	"github.com/nlewo/comin/internal/fetcher"
+	"github.com/nlewo/comin/internal/prometheus"
+	"github.com/nlewo/comin/internal/scheduler"
+	"github.com/nlewo/comin/internal/store"
+	"github.com/nlewo/comin/internal/utils"
+	"github.com/nlewo/comin/pkg/protobuf"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+)
+
+var emptyConfigurationOperations = map[string]map[string]string{}
+
+var mkDeployerMock = func(t *testing.T) *deployer.Deployer {
+	var deployFunc = func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
+		return false, "", nil
+	}
+	tmp := t.TempDir()
+	bk := broker.New()
+	bk.Start()
+
+	s, err := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	assert.Nil(t, err)
+	return deployer.New(s, deployFunc, nil, "", bk)
+}
+
+type ExecutorMock struct {
+	evalOk    chan bool
+	buildOk   chan bool
+	machineId string
+}
+
+func (n ExecutorMock) ReadMachineId() (string, error) {
+	return "", nil
+}
+func (n ExecutorMock) NeedToReboot(_, _ string) bool {
+	return false
+}
+func (n ExecutorMock) IsStorePathExist(storePath string) bool {
+	return false
+}
+func (n ExecutorMock) Deploy(ctx context.Context, outPath, operation string, profilePaths []string, stdout, stderr io.WriteCloser) (needToRestartComin bool, profilePath string, err error) {
+	return false, "", nil
+}
+func (n ExecutorMock) Eval(ctx context.Context, source *protobuf.Source, stdout, stderr io.WriteCloser) (drvPath string, outPath string, machineId string, err error) {
+	ok := <-n.evalOk
+	if ok {
+		return "drv-path", "out-path", n.machineId, nil
+	} else {
+		return "", "", n.machineId, fmt.Errorf("An error occured")
+	}
+}
+func (n ExecutorMock) Build(ctx context.Context, drvPath string, stdout, stdin io.WriteCloser) (err error) {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case ok := <-n.buildOk:
+		if ok {
+			return nil
+		} else {
+			return fmt.Errorf("An error occured")
+		}
+	}
+}
+func NewExecutorMock(machineId string) ExecutorMock {
+	return ExecutorMock{
+		evalOk:  make(chan bool, 1),
+		buildOk: make(chan bool, 1),
+	}
+}
+
+func TestBuild(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+	r := utils.NewRepositoryMock()
+	tmp := t.TempDir()
+	bk := broker.New()
+	bk.Start()
+	f := fetcher.NewGitFetcher(r, bk)
+	f.Start(t.Context())
+	s, _ := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	eMock := NewExecutorMock("")
+	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
+	var deployFunc = func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
+		return false, "profile-path", nil
+	}
+	d := deployer.New(s, deployFunc, nil, "", bk)
+	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	bc := NewConfirmer(bk, Without, 0, "")
+	bc.Start()
+	dc := NewConfirmer(bk, Without, 0, "")
+	dc.Start()
+	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "", "", e, bc, dc, bk, emptyConfigurationOperations)
+	go m.Run(t.Context())
+	assert.False(t, m.Fetcher.GetState().IsFetching.GetValue())
+	assert.False(t, m.Builder.State().IsEvaluating.GetValue())
+	assert.False(t, m.Builder.State().IsBuilding.GetValue())
+
+	commitId := "id-1"
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: commitId,
+	}
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.True(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.False(c, m.Builder.State().IsBuilding.GetValue())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// This simulates the failure of an evaluation
+	eMock.evalOk <- false
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.False(c, m.Builder.State().IsBuilding.GetValue())
+		g, _ := m.storage.GenerationGet(m.Builder.GenerationUuid)
+		assert.NotNil(c, g.EvalErr)
+		assert.Nil(c, m.deployer.GenerationToDeploy)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	commitId = "id-2"
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: commitId,
+	}
+	// This simulates the success of an evaluation
+	eMock.evalOk <- true
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.True(c, m.Builder.State().IsBuilding.GetValue())
+		g, _ := m.storage.GenerationGet(m.Builder.GenerationUuid)
+		assert.Empty(c, g.EvalErr)
+		assert.Nil(c, m.deployer.GenerationToDeploy)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// This simulates the failure of a build
+	eMock.buildOk <- false
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.False(c, m.Builder.State().IsBuilding.GetValue())
+		g, _ := m.storage.GenerationGet(m.Builder.GenerationUuid)
+		assert.NotNil(c, g.BuildErr)
+		assert.Nil(c, m.deployer.GenerationToDeploy)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// This simulates the success of a build
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: "id-3",
+	}
+	eMock.evalOk <- true
+	eMock.buildOk <- true
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.False(c, m.Builder.State().IsBuilding.GetValue())
+		g, _ := m.storage.GenerationGet(m.Builder.GenerationUuid)
+		assert.Empty(c, g.BuildErr)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// This simulates the success of another build and ensure this
+	// new build is the one proposed for deployment.
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: "id-4",
+	}
+	eMock.evalOk <- true
+	eMock.buildOk <- true
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(c, m.Builder.State().IsEvaluating.GetValue())
+		assert.False(c, m.Builder.State().IsBuilding.GetValue())
+		g, _ := m.storage.GenerationGet(m.Builder.GenerationUuid)
+		assert.Empty(c, g.BuildErr)
+	}, 5*time.Second, 100*time.Millisecond)
+
+	// This simulates the push of new commit while building
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: "id-5",
+	}
+	eMock.evalOk <- true
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.True(c, m.Builder.State().IsBuilding.GetValue())
+	}, 5*time.Second, 100*time.Millisecond)
+}
+
+func TestDeploy(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+	r := utils.NewRepositoryMock()
+	tmp := t.TempDir()
+	bk := broker.New()
+	bk.Start()
+	f := fetcher.NewGitFetcher(r, bk)
+	f.Start(t.Context())
+
+	s, _ := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	eMock := NewExecutorMock("")
+	eMock.evalOk <- true
+	eMock.buildOk <- true
+	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
+	var deployFunc = func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error) {
+		return false, "profile-path", nil
+	}
+	d := deployer.New(s, deployFunc, nil, "", bk)
+	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	bc := NewConfirmer(bk, Without, 0, "")
+	bc.Start()
+	dc := NewConfirmer(bk, Without, 0, "")
+	dc.Start()
+	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "", "", e, bc, dc, bk, emptyConfigurationOperations)
+	go m.Run(t.Context())
+	assert.False(t, m.Fetcher.GetState().IsFetching.GetValue())
+	assert.False(t, m.Builder.State().IsEvaluating.GetValue())
+	assert.False(t, m.Builder.State().IsBuilding.GetValue())
+	m.deployer.Submit(&protobuf.Generation{}, "test", false, "")
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.Equal(c, "profile-path", m.deployer.State().Deployment.ProfilePath)
+	}, 5*time.Second, 100*time.Millisecond)
+
+}
+
+func TestIncorrectMachineId(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+	r := utils.NewRepositoryMock()
+	tmp := t.TempDir()
+	bk := broker.New()
+	bk.Start()
+	f := fetcher.NewGitFetcher(r, bk)
+	f.Start(t.Context())
+
+	s, _ := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	eMock := NewExecutorMock("invalid-machine-id")
+	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
+	d := mkDeployerMock(t)
+	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	bc := NewConfirmer(bk, Without, 0, "")
+	bc.Start()
+	dc := NewConfirmer(bk, Without, 0, "")
+	dc.Start()
+	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "the-test-machine-id", "", e, bc, dc, bk, emptyConfigurationOperations)
+	go m.Run(t.Context())
+
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: "id",
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.False(t, m.GetState().Builder.IsBuilding.GetValue())
+	}, 5*time.Second, 100*time.Millisecond)
+}
+
+func TestCorrectMachineId(t *testing.T) {
+	logrus.SetLevel(logrus.DebugLevel)
+	r := utils.NewRepositoryMock()
+	tmp := t.TempDir()
+	bk := broker.New()
+	bk.Start()
+	f := fetcher.NewGitFetcher(r, bk)
+	f.Start(t.Context())
+
+	s, _ := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	eMock := NewExecutorMock("the-test-machine-id")
+	eMock.evalOk <- true
+	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
+	d := mkDeployerMock(t)
+	e, _ := executor.NewGitNixFlakeNixOS("", false)
+	bc := NewConfirmer(bk, Without, 0, "")
+	bc.Start()
+	dc := NewConfirmer(bk, Without, 0, "")
+	dc.Start()
+	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "the-test-machine-id", "", e, bc, dc, bk, emptyConfigurationOperations)
+	go m.Run(t.Context())
+
+	f.TriggerFetch([]string{"remote"})
+	r.RsCh <- &protobuf.GitRepositoryStatus{
+		SelectedCommitId: "id",
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.True(c, m.GetState().Builder.IsBuilding.GetValue())
+	}, 7*time.Second, 100*time.Millisecond)
+}
+
+func TestManagerWithDarwinConfiguration(t *testing.T) {
+	r := utils.NewRepositoryMock()
+	tmp := t.TempDir()
+	eMock := NewExecutorMock("")
+	eMock.buildOk <- true
+	bk := broker.New()
+	bk.Start()
+	f := fetcher.NewGitFetcher(r, bk)
+
+	s, _ := store.New(bk, tmp+"/state.json", tmp+"/gcroots", 1, 1, 1)
+	b := builder.New(s, eMock, bk, "repoPath", "", "", "my-machine", false, 2*time.Second, 2*time.Second, 0, 30*time.Second, "")
+	d := mkDeployerMock(t)
+
+	// Test with Darwin configuration
+	e, _ := executor.NewGitNixFlakeDarwin("", false)
+	bc := NewConfirmer(bk, Without, 0, "")
+	bc.Start()
+	dc := NewConfirmer(bk, Without, 0, "")
+	dc.Start()
+	m := New(s, prometheus.New(), scheduler.New(), f, b, d, "darwin-machine-id", "", e, bc, dc, bk, emptyConfigurationOperations)
+
+	// Verify the manager was created with the correct configuration attribute
+	assert.Equal(t, "darwin-machine-id", m.machineId)
+
+	// Verify the Darwin manager functions correctly without errors
+	state := m.toState()
+	assert.NotNil(t, state)
+	assert.Equal(t, "darwin-machine-id", m.machineId)
+}

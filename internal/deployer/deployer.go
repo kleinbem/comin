@@ -1,0 +1,271 @@
+package deployer
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/dustin/go-humanize"
+	"github.com/nlewo/comin/internal/broker"
+	"github.com/nlewo/comin/internal/store"
+	"github.com/nlewo/comin/internal/types"
+	"github.com/nlewo/comin/internal/utils"
+	"github.com/nlewo/comin/pkg/protobuf"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+const (
+	ReasonDeploymentBuilder = "builder"
+	ReasonDeploymentManual  = "manual"
+)
+
+type DeployFunc func(context.Context, string, string, []string, io.WriteCloser, io.WriteCloser) (bool, string, error)
+
+type Deployer struct {
+	GenerationCh     chan *protobuf.Generation
+	deployerFunc     DeployFunc
+	DeploymentDoneCh chan *protobuf.Deployment
+	mu               sync.Mutex
+	deployment       atomic.Pointer[protobuf.Deployment]
+	isDeploying      atomic.Bool
+	// The next generation to deploy. nil when there is no new generation to deploy
+	GenerationToDeploy *protobuf.Generation
+	// The operation to use for the next deployment
+	Operation string
+	// Reason is the reason of the next deployment
+	Reason                string
+	generationAvailableCh chan struct{}
+	postDeploymentCommand string
+
+	isSuspended atomic.Bool
+	resumeCh    chan struct{}
+	// This is true when the runner is actually suspended. This is
+	// mainly used for testing purpose.
+	runnerIsSuspended atomic.Bool
+	store             *store.Store
+	broker            *broker.Broker
+}
+
+func (d *Deployer) State() *protobuf.Deployer {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return &protobuf.Deployer{
+		IsDeploying:        wrapperspb.Bool(d.isDeploying.Load()),
+		GenerationToDeploy: d.GenerationToDeploy,
+		Operation:          d.Operation,
+		Deployment:         d.deployment.Load(),
+		IsSuspended:        wrapperspb.Bool(d.isSuspended.Load()),
+	}
+}
+
+func (d *Deployer) Deployment() *protobuf.Deployment {
+	return d.deployment.Load()
+}
+
+func (d *Deployer) IsDeploying() bool {
+	return d.isDeploying.Load()
+}
+
+func (d *Deployer) RunnerIsSuspended() bool {
+	return d.runnerIsSuspended.Load()
+}
+
+func (d *Deployer) IsSuspended() bool {
+	return d.isSuspended.Load()
+}
+
+func showDeployment(padding string, d *protobuf.Deployment) {
+	switch d.Status {
+	case store.StatusToString(store.Running):
+		fmt.Printf("%sDeployment is running since %s\n", padding, humanize.Time(d.StartedAt.AsTime()))
+		fmt.Printf("%sOperation %s\n", padding, d.Operation)
+	case store.StatusToString(store.Done):
+		fmt.Printf("%sDeployment succeeded %s\n", padding, humanize.Time(d.EndedAt.AsTime()))
+		fmt.Printf("%sOperation %s\n", padding, d.Operation)
+		fmt.Printf("%sProfilePath %s\n", padding, d.ProfilePath)
+	case store.StatusToString(store.Failed):
+		fmt.Printf("%sDeployment failed %s\n", padding, humanize.Time(d.EndedAt.AsTime()))
+		fmt.Printf("%sOperation %s\n", padding, d.Operation)
+		fmt.Printf("%sProfilePath %s\n", padding, d.ProfilePath)
+	}
+	fmt.Printf("%sGeneration %s\n", padding, d.Generation.Uuid)
+	if d.Generation.Source != nil && d.Generation.Source.GetGit() != nil {
+		git := d.Generation.Source.GetGit()
+		fmt.Printf("%sCommit ID %s from %s/%s\n", padding, git.SelectedCommitId, git.SelectedRemoteName, git.SelectedBranchName)
+		fmt.Printf("%sCommit message %s\n", padding, strings.Trim(git.SelectedCommitMsg, "\n"))
+	}
+	fmt.Printf("%sOutpath %s\n", padding, d.Generation.OutPath)
+}
+
+func Show(s *protobuf.Deployer, padding string) {
+	fmt.Printf("  Deployer\n")
+	if s.Deployment == nil {
+		fmt.Printf("%sNo deployment yet\n", padding)
+		return
+	}
+	showDeployment(padding, s.Deployment)
+}
+
+func New(store *store.Store, deployFunc DeployFunc, previousDeployment *protobuf.Deployment, postDeploymentCommand string, b *broker.Broker) *Deployer {
+	if previousDeployment != nil {
+		logrus.Infof("deployer: initializing with previous deployment %s", previousDeployment.Uuid)
+	}
+	deployer := &Deployer{
+		store:                 store,
+		DeploymentDoneCh:      make(chan *protobuf.Deployment, 1),
+		deployerFunc:          deployFunc,
+		generationAvailableCh: make(chan struct{}, 1),
+		postDeploymentCommand: postDeploymentCommand,
+		broker:                b,
+
+		resumeCh: make(chan struct{}, 1),
+	}
+	deployer.deployment.Store(previousDeployment)
+
+	dState := store.GetState().Deployer
+	isSuspended := dState.IsSuspended
+	if isSuspended {
+		logrus.Infof("deployer: suspended because of %s", dState.SuspendReason)
+		deployer.isSuspended.Store(true)
+	}
+
+	return deployer
+}
+
+func (d *Deployer) Suspend(reason string) {
+	d.isSuspended.Store(true)
+	d.store.DeployerUpdate(&protobuf.DeployerState{
+		IsSuspended:   true,
+		SuspendReason: reason,
+	})
+}
+
+func (d *Deployer) Resume() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.isSuspended.Store(false)
+	d.store.DeployerUpdate(&protobuf.DeployerState{
+		IsSuspended:   false,
+		SuspendReason: "",
+	})
+	select {
+	case d.resumeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (d *Deployer) IsAlreadyDeployed(generation *protobuf.Generation, operation string) bool {
+	previous := d.deployment.Load()
+	if previous == nil {
+		logrus.Infof("deployer: no previous deployment found for generation %s", generation.Uuid)
+		return false
+	}
+	if generation.OutPath != previous.Generation.OutPath {
+		logrus.Infof("deployer: out path %s differs from previous out path %s for generation %s", generation.OutPath, previous.Generation.OutPath, generation.Uuid)
+		return false
+	}
+	if previous.Operation != operation {
+		logrus.Infof("deployer: operation %s differs from previous operation %s for generation %s", operation, previous.Operation, generation.Uuid)
+		return false
+	}
+	logrus.Infof("deployer: skipping deployment of generation %s: out path %s with operation %s has already been deployed", generation.Uuid, generation.OutPath, operation)
+	return true
+}
+
+// Submit submits a generation to be deployed. If a deployment is
+// running, this generation will be deployed once the current
+// deployment is finished. If this generation is the same than the one
+// of the last deployment, this generation is skipped.
+func (d *Deployer) Submit(generation *protobuf.Generation, operation string, force bool, reason string) {
+	forceStr := "false"
+	if force {
+		forceStr = "true"
+	}
+	logrus.Infof("deployer: submitting generation %s with operation %s (force: %s)", generation.Uuid, operation, forceStr)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if force || !d.IsAlreadyDeployed(generation, operation) {
+		d.GenerationToDeploy = generation
+		d.Operation = operation
+		d.Reason = reason
+		select {
+		case d.generationAvailableCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (d *Deployer) Run(ctx context.Context) {
+	go func() {
+		for {
+			var cominNeedRestart bool
+			var profilePath string
+			var err error
+			<-d.generationAvailableCh
+
+			if d.isSuspended.Load() {
+				d.runnerIsSuspended.Store(true)
+				<-d.resumeCh
+				d.runnerIsSuspended.Store(false)
+			}
+
+			d.mu.Lock()
+			g := d.GenerationToDeploy
+			operationSubmitted := d.Operation
+			d.GenerationToDeploy = nil
+			d.mu.Unlock()
+			logrus.Infof("deployer: deploying generation %s with the submitted operation %s", g.Uuid, operationSubmitted)
+			booted, current := utils.GetBootedAndCurrentStorepaths()
+			dpl := d.store.NewDeployment(g, operationSubmitted, d.Reason, booted, current)
+			operationComputed := dpl.Operation
+			d.mu.Lock()
+			d.deployment.Store(dpl)
+			d.isDeploying.Store(true)
+			d.mu.Unlock()
+			if err := d.store.DeploymentStarted(dpl.Uuid, booted, current); err != nil {
+				logrus.Errorf("deployer: could not update the deployment %s in the store", dpl.Uuid)
+				continue
+			}
+			if operationComputed != types.OperationNull {
+				profilePaths := d.store.GetDeploymentProfilePaths()
+				stdout, stderr := d.broker.GetLogger("deployment", g.Uuid)
+				cominNeedRestart, profilePath, err = d.deployerFunc(
+					ctx,
+					g.OutPath,
+					operationComputed,
+					profilePaths,
+					stdout,
+					stderr,
+				)
+				// We close the writers to stop associated goroutines
+				_ = stdout.Close()
+				_ = stderr.Close()
+			}
+			deployment := d.Deployment()
+			deployment.EndedAt = timestamppb.New(time.Now().UTC())
+			if err := d.store.DeploymentFinished(dpl.Uuid, err, cominNeedRestart, profilePath, booted, current); err != nil {
+				logrus.Errorf("deployer: could not update the deployment %s in the store", dpl.Uuid)
+				continue
+			}
+			cmd := d.postDeploymentCommand
+			if cmd != "" {
+				// TODO: we should also log these outputs
+				_, err = utils.RunPostCommand(cmd, "deploy", deployment.Generation, deployment.Status, deployment.ErrorMsg)
+				if err != nil {
+					logrus.Errorf("deployer: deploying generation %s, post deployment command [%s] failed %v", g.Uuid, cmd, err)
+				}
+			}
+
+			d.isDeploying.Store(false)
+			d.deployment.Store(deployment)
+			d.DeploymentDoneCh <- d.Deployment()
+		}
+	}()
+}
